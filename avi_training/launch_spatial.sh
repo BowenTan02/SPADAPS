@@ -6,7 +6,7 @@ set -euo pipefail
 
 # Repo + data (override via environment)
 export GUIDED_DIFFUSION_PATH="${GUIDED_DIFFUSION_PATH:-/homes/tan583/scratch/guided-diffusion}"
-DATA_DIR="${DATA_DIR:-/PATH/TO/normalized_logflux_frames}"   # SAME frames/normalization as the 2D prior
+DATA_DIR="${DATA_DIR:-$GUIDED_DIFFUSION_PATH/data/}"  # SAME frames/normalization as the 2D prior
 LOG_DIR="${LOG_DIR:-avi_spatial_256}"
 NGPU="${NGPU:-1}"
 

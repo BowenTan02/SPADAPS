@@ -61,6 +61,61 @@ from guided_diffusion.train_util import TrainLoop
 
 from avi_gamma import make_avi_training_losses
 
+# ---------------------------------------------------------------------------
+# Honor a user-pinned CUDA_VISIBLE_DEVICES for single-process runs.
+#
+# guided-diffusion's dist_util.setup_dist() does
+#     os.environ["CUDA_VISIBLE_DEVICES"] = f"{MPI_rank % GPUS_PER_NODE}"
+# i.e. it overwrites CUDA_VISIBLE_DEVICES with "0" for a single process. That
+# silently ignores `CUDA_VISIBLE_DEVICES=1 python ...` and binds the job to GPU 0.
+# Restoring the pin *after* setup_dist is too late: CUDA caches the visible-device
+# list at the first torch.cuda call (th.cuda.is_available() inside setup_dist), so
+# we must keep the assignment from clobbering the pin in the first place.
+#
+# We force any write to CUDA_VISIBLE_DEVICES *during* setup_dist back to the pinned
+# value, but ONLY when (a) the user pinned a device and (b) this is a single
+# process. Real multi-GPU/MPI runs (size > 1) keep guided-diffusion's per-rank
+# assignment untouched.
+# ---------------------------------------------------------------------------
+_PINNED_CVD = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+
+
+def _install_single_gpu_cvd_guard():
+    if not _PINNED_CVD:
+        return
+    try:
+        from mpi4py import MPI
+        if MPI.COMM_WORLD.Get_size() != 1:
+            return  # genuine multi-GPU run -> keep rank-based GPU assignment
+    except Exception:
+        pass
+
+    _EnvType = type(os.environ)
+    _real_setitem = _EnvType.__setitem__
+    _state = {"freeze": False}
+
+    def _guarded_setitem(self, key, value):
+        if _state["freeze"] and key == "CUDA_VISIBLE_DEVICES":
+            value = _PINNED_CVD  # override rank%GPUS_PER_NODE with the user's pin
+        return _real_setitem(self, key, value)
+
+    _EnvType.__setitem__ = _guarded_setitem
+
+    _orig_setup_dist = dist_util.setup_dist
+
+    def _setup_dist(*a, **k):
+        _state["freeze"] = True
+        try:
+            return _orig_setup_dist(*a, **k)
+        finally:
+            _state["freeze"] = False
+
+    dist_util.setup_dist = _setup_dist
+    print(f"[cvd-guard] honoring CUDA_VISIBLE_DEVICES={_PINNED_CVD} for single-process run")
+
+
+_install_single_gpu_cvd_guard()
+
 # Architecture of the 2D score prior (see the notebook's SPATIAL_2D_OVERRIDES).
 # The AVI net reuses this exact backbone; learn_sigma=True yields out_channels=2.
 SPATIAL_OVERRIDES = dict(
