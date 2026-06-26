@@ -124,7 +124,8 @@ def make_avi_training_losses(log_flux_max, rate_link="normflux", eps=1e-4):
             noise = torch.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise=noise)
         out = model(x_t, self._scale_timesteps(t), **model_kwargs)      # [B, 2, ...]
-        loss_elem = avi_gamma_loss_elementwise(out, x_start, log_flux_max, rate_link, eps)
+        out = out.float()                                              # lgamma/exp in fp32 (fp16-safe)
+        loss_elem = avi_gamma_loss_elementwise(out, x_start.float(), log_flux_max, rate_link, eps)
         return {"loss": mean_flat(loss_elem)}
 
     return training_losses

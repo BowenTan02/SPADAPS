@@ -4,6 +4,9 @@
 # Multi-GPU:  NGPU=4 bash launch_spatial.sh
 set -euo pipefail
 
+# Reduce allocator fragmentation (you were ~512 MiB short on a 32GB card).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 # Repo + data (override via environment)
 export GUIDED_DIFFUSION_PATH="${GUIDED_DIFFUSION_PATH:-/homes/tan583/scratch/guided-diffusion}"
 DATA_DIR="${DATA_DIR:-$GUIDED_DIFFUSION_PATH/data/}"  # SAME frames/normalization as the 2D prior
@@ -14,6 +17,7 @@ ARGS=(
   --data_dir "$DATA_DIR"
   --image_size 256
   --batch_size 8
+  --microbatch 2          # peak activations = 2 frames; grads accumulate to effective batch 8
   --lr 1e-4
   --lr_anneal_steps 50000
   --save_interval 5000

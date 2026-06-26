@@ -129,6 +129,9 @@ SPATIAL_OVERRIDES = dict(
     use_scale_shift_norm=True,
     class_cond=False,
     use_fp16=False,
+    use_checkpoint=True,   # gradient checkpointing: ~30% slower, large activation-memory cut
+                           # (runtime only; does NOT affect the saved checkpoint weights).
+                           # Needed to fit this 552M UNet at 256^2 on a 32GB GPU.
 )
 
 
