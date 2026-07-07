@@ -13,11 +13,22 @@ DATA_DIR="${DATA_DIR:-$GUIDED_DIFFUSION_PATH/data/}"  # SAME frames/normalizatio
 LOG_DIR="${LOG_DIR:-avi_spatial_256}"
 NGPU="${NGPU:-1}"
 
+# ---- resume + speed knobs (all overridable via env) ----
+#   Resume (same fp32 config):  RESUME_CHECKPOINT=avi_spatial_256/model020000.pt bash launch_spatial.sh
+#   Faster (fp16, see notes):   USE_FP16=True USE_CHECKPOINT=False MICROBATCH=8 \
+#                                 RESUME_CHECKPOINT=avi_spatial_256/model020000.pt bash launch_spatial.sh
+RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"   # path to modelNNNNNN.pt to resume from ("" = fresh start)
+USE_FP16="${USE_FP16:-False}"                # True ~= 2x on V100 tensor cores + halves activations
+USE_CHECKPOINT="${USE_CHECKPOINT:-True}"     # gradient checkpointing; False is ~30% faster if it fits
+MICROBATCH="${MICROBATCH:-2}"                # grads accumulate to effective batch 8; 8 = single pass
+
 ARGS=(
   --data_dir "$DATA_DIR"
   --image_size 256
   --batch_size 8
-  --microbatch 2          # peak activations = 2 frames; grads accumulate to effective batch 8
+  --microbatch "$MICROBATCH"
+  --use_fp16 "$USE_FP16"
+  --use_checkpoint "$USE_CHECKPOINT"
   --lr 1e-4
   --lr_anneal_steps 50000
   --save_interval 5000
@@ -26,6 +37,9 @@ ARGS=(
   --rate_link normflux
   --log_dir "$LOG_DIR"
 )
+if [ -n "$RESUME_CHECKPOINT" ]; then
+  ARGS+=(--resume_checkpoint "$RESUME_CHECKPOINT")
+fi
 
 cd "$(dirname "$0")"
 if [ "$NGPU" -gt 1 ]; then

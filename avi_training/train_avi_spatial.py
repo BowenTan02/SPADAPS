@@ -166,6 +166,7 @@ def main():
     if args.log_dir:
         os.environ.setdefault("OPENAI_LOGDIR", args.log_dir)
     dist_util.setup_dist()
+    th.backends.cudnn.benchmark = True   # autotune convs for the fixed 256x256 input size
     logger.configure()
 
     logger.log("creating 2D spatial AVI Gamma net (in_channels=1, learn_sigma=True -> 2 channels)...")
