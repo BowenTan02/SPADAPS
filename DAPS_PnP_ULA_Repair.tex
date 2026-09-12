@@ -1,0 +1,71 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{hyperref}
+
+\newcommand{\bxi}{\xi}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+
+\title{Modifying DAPS for Low-Photon SPAD Reconstruction on Inner Sampler Side}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Setting}
+
+Let $x \in \R^{T\times H\times W}$ be normalized log-flux in $[-1,1]$, related to the physical flux $\phi$ by $\log\phi = \tfrac{L}{2}(x+1)$ with $L=\log\phi_{\max}$. Each voxel's SPAD bin count is Poisson,
+\[
+N_{kij} \sim \mathrm{Poisson}\big(\mu_{kij}\big), \qquad \mu_{kij} = B_k\big(\alpha\,\phi_{kij}+d\big),
+\]
+with $B_k$ the exposure of bin $k$, $\alpha$ the detection rate, and $d$ a dark-count rate. This likelihood is exact and voxel-separable by physics: given the flux, photon detections at different voxels are conditionally independent.
+
+We want to sample $x_0 \sim p(x_0 \mid y)$ under a diffusion prior $p(x_0)$ realized as two pretrained denoisers (spatial and temporal), using Decoupled Annealing Posterior Sampling (DAPS) as the outer scaffold. DAPS anneals over noise levels $\sigma_t$ (equivalently DDPM timesteps $t$, with $\sigma_t^2=(1-\bar\alpha_t)/\bar\alpha_t$), alternating an outer noise-level update with an inner step that samples from the conditional $p(x_0\mid x_t,y)$.
+
+\section{Why the inner step fails at low photon count}
+
+DAPS approximates the denoising posterior $p(x_0\mid x_t)$ as an isotropic Gaussian centered at the Tweedie estimate,
+\[
+p(x_0\mid x_t) \;\approx\; \mathcal N\big(\hat x_0(x_t),\, \sigma_t^2 I\big).
+\]
+Combined with the likelihood, the inner target $p(y\mid x_0)\,\mathcal N(\hat x_0,\sigma_t^2 I)$ is then a \emph{product of two voxel-separable factors}: the Poisson likelihood is separable by physics, and the isotropic Gaussian is separable by construction. A voxel-separable target has a voxel-separable stationary law — no step of the sampler can move evidence from one voxel to a neighbor. At photon rates of $10^{-3}$–$5\times10^{-3}$ per pixel this is exactly the salt-and-pepper failure mode: a voxel that registered a photon is pulled up, its neighbors are pulled down, and nothing couples them.
+
+The coupling that is missing lives in the exact conditional score. Writing $p(x_0\mid x_t)\propto q(x_t\mid x_0)\,p(x_0)$,
+\begin{equation}
+\nabla_{x_0}\log p(x_0\mid x_t) \;=\; \underbrace{\nabla\log p(x_0)}_{\text{coupled}} \;+\; \underbrace{\tfrac{\sqrt{\bar\alpha_t}}{1-\bar\alpha_t}\big(x_t^{\mathrm{DDPM}}-\sqrt{\bar\alpha_t}\,x_0\big)}_{\text{separable, exact}}. \label{eq:decomp}
+\end{equation}
+The second term is the exact score of the (Gaussian, separable) forward kernel; the first is the network's coupled prior score. DAPS's isotropic-Gaussian approximation keeps only the separable term and lets $\nabla\log p(x_0)$ enter through the anchor \emph{location} $\hat x_0$, evaluated once per outer step rather than once per inner iteration. The fix is to keep both terms of \eqref{eq:decomp} live inside the inner sampler.
+
+\section{Repaired inner sampler: annealed PnP-ULA}
+
+Fix an outer noise level $\sigma_t$ and iterate (in EDM convention $x_t = x_0+\sigma_t\bxi$, where the tether term in \eqref{eq:decomp} is identically $(x_t-x_0)/\sigma_t^2$). Replace the coupled term $\nabla\log p(x_0)$ by the score of a small Gaussian-smoothed prior $p_\varepsilon = p_{\mathrm{data}} * \mathcal N(0,\sigma_\varepsilon^2 I)$, obtained from the same denoiser network at a fixed small noise level $\varepsilon$:
+\[
+s_{\theta,\varepsilon}(x) \;:=\; \nabla\log p_\varepsilon(x) \;=\; \frac{D_\varepsilon(x)-x}{\sigma_\varepsilon^2}, \qquad D_\varepsilon(x) := \E[x_0\mid x_\varepsilon = x] \;\;(\text{Tweedie}).
+\]
+The inner sampler is then unadjusted Langevin dynamics on
+\[
+\pi_t(x) \;\propto\; \underbrace{p(y\mid x)}_{\text{Poisson}} \cdot \underbrace{q(x_t\mid x)}_{\text{exact tether}} \cdot \underbrace{p_\varepsilon(x)}_{\text{coupled prior}},
+\]
+\begin{equation}
+x^{(k+1)} \;=\; x^{(k)} + \delta\Big[\lambda_d\,\nabla\log p(N\mid x^{(k)}) \;+\; \frac{x_t-x^{(k)}}{\sigma_t^2} \;+\; s_{\theta,\varepsilon}\big(x^{(k)}\big)\Big] + \sqrt{2\delta}\,\bxi^{(k)}, \label{eq:ula}
+\end{equation}
+with $\bxi^{(k)}\sim\mathcal N(0,I)$ and $\lambda_d=1$ the Bayes-correct weight. Every term in \eqref{eq:ula} is now evaluated at the \emph{current} iterate $x^{(k)}$, at every inner iteration: the prior score is coupled and applied inside the loop rather than once as an anchor location, so a photon's evidence can propagate spatially and temporally within a single outer step. This is annealed Plug-and-Play ULA (PnP-ULA), whose regularity requirement --- a bounded score after Gaussian smoothing --- is exactly what $p_\varepsilon$ supplies. Because $x\in[-1,1]$ and the Poisson score is bounded, no reflection or barrier scheme is needed.
+
+\section{An Alternative: Coupling via a Learned Conjugate Prior}
+
+Section 3 repairs the inner sampler by iterating a coupled score until $\pi_t$'s two factors mix. Here we take a shortcut: replace the Gaussian anchor $\mathcal N(\hat x_0,\sigma_t^2 I)$ with a belief that is already conjugate to the Poisson likelihood, so the two factors combine exactly, in one step, with no iteration at all.
+
+Reinterpret each voxel's flux as a Poisson rate $\theta=\phi/\phi_{\max}\in(0,1]$, with $E\theta=\mu$ its exposure-scaled mean. Train a network $\zeta_\rho$ to output a Gamma belief about $\theta$,
+\[
+p(\theta\mid x_t)\;\approx\;q_\rho(\theta\mid x_t)=\mathrm{Gamma}(\theta;a_\rho,b_\rho), \qquad a_\rho,b_\rho:=\zeta_\rho(x_t,t)>0,
+\]
+trained simulation-free — regressing $(a_\rho,b_\rho)$ toward the clean rate $\theta_0$ under a Gamma log-likelihood over forward-diffusion pairs $(x_0,x_t)$ — so no measurement $y$ is ever needed to train it.
+
+At a voxel with pooled count $Y$ and exposure $E$, the Poisson likelihood $p(Y\mid\theta)\propto\theta^Ye^{-E\theta}$ lies in the same exponential family as $q_\rho$, so the posterior is exact and closed-form:
+\[
+p(\theta\mid x_t,y)\;\propto\;\theta^{(a_\rho+Y)-1}e^{-(b_\rho+E)\theta} \;=\; \mathrm{Gamma}(a_\rho+Y,\ b_\rho+E).
+\]
+One draw from this Gamma, mapped back to $x_0$, replaces the entire Langevin loop of Section 3. (Spatial and temporal belief networks are combined the same way, by simply adding their natural parameters.)
+\end{document}
