@@ -63,6 +63,7 @@ __all__ = [
     "langevin_prox_tree",
     "binomial_loglik", "exact_inner_sample",
     "sample_daps_3d_v2", "sample_daps_v2",
+    "tweedie_anchor", "measure_anchor_mse", "anchor_sd_from_table",
 ]
 
 
@@ -440,6 +441,72 @@ def load_tree_module(notebook_path=None, log_flux_max=None, b_offset=1e-7,
 
 
 # ---------------------------------------------------------------------------
+# 5b. The one-step Tweedie anchor, and the calibration of its variance
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def tweedie_anchor(x_t, t_cur, sigma_arr, alphas_cumprod_t, eps_2d_fn, eps_1d_fn, fuse):
+    """x0_hat = x_t - sigma_t * eps_fused(sqrt(abar_t) x_t, t): the sampler's own
+    num_inner_pfode=1 anchor, factored out so the variance calibration below
+    measures EXACTLY the estimator the sampler uses. Unclamped; callers clamp."""
+    sg = float(sigma_arr[int(t_cur)])
+    xd = torch.sqrt(alphas_cumprod_t[int(t_cur)]) * x_t
+    eps, _, _ = fused_eps(xd, int(t_cur), sg, eps_2d_fn, eps_1d_fn, **fuse)
+    return x_t - sg * torch.nan_to_num(eps)
+
+
+@torch.no_grad()
+def measure_anchor_mse(x0_true, t_levels, sigma_arr, alphas_cumprod_t,
+                       eps_2d_fn, eps_1d_fn, fuse, *, seed=0, verbose=True):
+    """Per-voxel MSE of the anchor at each noise level: the calibrated DAPS anchor
+    variance.
+
+    Tweedie's second-order identity gives Cov(x0 | x_t) = sigma_t^2 J_x0hat(x_t),
+    and E||x0 - x0_hat||^2 / d = sigma_t^2 E[J_ii] for the MMSE denoiser. DAPS
+    approximates p(x0|x_t) by N(x0_hat, r_t^2 I) with r_t "specified using
+    heuristics" (paper, Sec. 3.2); the implementation uses r_t = sigma_t, i.e.
+    J = I, which is exact only for a flat prior. Measuring the per-voxel MSE of
+    the SAME anchor estimator on clean data replaces the heuristic with the
+    quantity the identity names: r_t^2 = MSE(sigma_t).
+
+    2026-09-12 cluster results motivating this: the isotropic draw (r_t =
+    sigma_t) gave candidate_rate 3.6e-3 / t_corr 0.18; the conditional MAP of
+    the same target (the r_t -> 0 limit) gave 3.8e-6 / 0.58 in the same outer
+    loop. The calibrated r_t sits between the two, close to the MAP end since
+    E[J_ii] << 1, and is the one draw that is both self-cleaning and honest.
+
+    x0_true: [1,T,H,W] clean normalized log-flux (a HELD-OUT clip if possible;
+    the table is ~20 scalars, so leakage from the test clip is negligible but
+    should be disclosed). Returns a list of dicts (t, sigma, mse, r, EJ).
+    """
+    g = torch.Generator(device=x0_true.device); g.manual_seed(int(seed))
+    rows = []
+    for t in t_levels:
+        t = int(t); sg = float(sigma_arr[t])
+        x_t = x0_true + sg * torch.randn(x0_true.shape, device=x0_true.device,
+                                         dtype=x0_true.dtype, generator=g)
+        x0_hat = tweedie_anchor(x_t, t, sigma_arr, alphas_cumprod_t,
+                                eps_2d_fn, eps_1d_fn, fuse).clamp_(-1.0, 1.0)
+        mse = float(((x0_hat - x0_true) ** 2).mean())
+        rows.append(dict(t=t, sigma=sg, mse=mse, r=math.sqrt(mse), EJ=mse / sg ** 2))
+        if verbose:
+            print(f"  anchor calibration t={t:4d} sigma={sg:8.4f}  r_t={math.sqrt(mse):.4f}  "
+                  f"E[J]={mse / sg ** 2:.3e}  (isotropic DAPS would use r_t={sg:.4f})", flush=True)
+    return rows
+
+
+def anchor_sd_from_table(rows, floor=1e-4):
+    """anchor_sd_fn(step, sigma_t) -> r_t, log-log interpolated from measure_anchor_mse
+    rows (or a loaded JSON list with 'sigma' and 'r'). Clamped to the table's
+    sigma range; r never below `floor` so the exact sampler's tether stays finite."""
+    pts = sorted(((float(r["sigma"]), max(float(r["r"]), floor)) for r in rows))
+    ls = np.log([p[0] for p in pts]); lr = np.log([p[1] for p in pts])
+    def fn(step, sigma_t):
+        return float(np.exp(np.interp(math.log(max(float(sigma_t), 1e-12)), ls, lr)))
+    fn.table = pts
+    return fn
+
+
+# ---------------------------------------------------------------------------
 # 6. Composed sampler -- fused priors + sigma-scaled lr + choice of inner kernel
 # ---------------------------------------------------------------------------
 @torch.no_grad()
@@ -600,7 +667,7 @@ def sample_daps_3d_v2(
     fuse_mode="average", fuse_w=0.5, switch_sigma=0.5, temporal_first=False,
     clip_x=True, num_diffusion_steps=1000, snapshot_every=10, verbose=True,
     lr_fn=None, seed=None, exact_final_mean=True, step_log=None,
-    exact_frame_chunk=64,
+    exact_frame_chunk=64, anchor_sd_fn=None,
 ):
     """DAPS with fused priors, a sigma-scaled step size, and a choice of inner kernel.
 
@@ -643,6 +710,12 @@ def sample_daps_3d_v2(
       * ``exact_frame_chunk`` is the inner step's memory knob; it does not move
         the sampled law. Measured peak added over the inputs at 1024x256x256:
         unchunked 4.1 GiB, 256 -> 2.7, 64 -> 1.0, 16 -> 0.8.
+      * ``anchor_sd_fn(step, sigma_t) -> r_t`` sets the SURROGATE's standard
+        deviation, N(x0_hat, r_t^2 I), for every inner kind (tether width of the
+        exact draw, rho = 1/(lambda r_t^2) of condmap, anchor precision of the
+        chains). None keeps DAPS's r_t = sigma_t. See measure_anchor_mse /
+        anchor_sd_from_table for the Tweedie-calibrated choice. The step-size
+        schedule of the chain kernels stays on sigma_t.
     """
     g_init, g_outer, g_inner = make_rng_streams(seed, device)
     t_indices = np.linspace(num_diffusion_steps - 1, 0, num_annealing + 1).astype(np.int64)
@@ -662,10 +735,8 @@ def sample_daps_3d_v2(
             seq = np.unique(np.clip(np.linspace(t_cur, 0, num_inner_pfode + 1)
                                     .astype(np.int64), 0, len(sigma_arr) - 1))[::-1]
         if num_inner_pfode <= 1:
-            sg = float(sigma_arr[t_cur])
-            xd = torch.sqrt(alphas_cumprod_t[t_cur]) * x
-            eps, _, _ = fused_eps(xd, t_cur, sg, eps_2d_fn, eps_1d_fn, **fuse)
-            x0_hat = x - sg * torch.nan_to_num(eps)
+            x0_hat = tweedie_anchor(x, t_cur, sigma_arr, alphas_cumprod_t,
+                                    eps_2d_fn, eps_1d_fn, fuse)
         else:
             for i in range(len(seq) - 1):
                 tc, tn = int(seq[i]), int(seq[i + 1])
@@ -681,27 +752,29 @@ def sample_daps_3d_v2(
         lr = (float(lr_fn(step, sigma_t)) if lr_fn is not None
               else sigma_scaled_lr(sigma_t, c=lr_c, lr_cap=lr_cap))
         take_mean = bool(exact_final_mean) and step == num_annealing - 1
+        # Surrogate width r_t: DAPS's sigma_t unless a calibration is supplied.
+        anc = float(anchor_sd_fn(step, sigma_t)) if anchor_sd_fn is not None else sigma_t
         if inner_kind == "condmap":
             # Conditional MAP of the inner target: no Brownian term, no chain.
             # A prox arm with num_mcmc=1 is NOT this -- its first half-step kicks
             # the iterate by sqrt(2 lr) ~ sqrt(2) sigma_t before the solve.
             if prox_fn is None:
                 raise ValueError("inner_kind='condmap' needs prox_fn(z, rho)")
-            rho = 1.0 / max(float(lambda_data) * sigma_t ** 2, 1e-30)
+            rho = 1.0 / max(float(lambda_data) * anc ** 2, 1e-30)
             x0_y = prox_fn(x0_hat, rho)
             if clip_x:
                 x0_y = x0_y.clamp(-1.0, 1.0)
         elif inner_kind == "prox":
             if prox_fn is None:
                 raise ValueError("inner_kind='prox' needs prox_fn(z, rho)")
-            x0_y = langevin_prox_newton(x0_hat, sigma_t, prox_fn, lr, num_mcmc,
+            x0_y = langevin_prox_newton(x0_hat, anc, prox_fn, lr, num_mcmc,
                                         lambda_data=lambda_data, clip_x=clip_x,
                                         generator=g_inner)
         elif inner_kind == "exact":
             if obs_counts is None or obs_sizes is None or ppp_scale is None:
                 raise ValueError("inner_kind='exact' needs obs_counts, obs_sizes "
                                  "and ppp_scale")
-            x0_y = exact_inner_sample(x0_hat, sigma_t, obs_counts, obs_sizes,
+            x0_y = exact_inner_sample(x0_hat, anc, obs_counts, obs_sizes,
                                       ppp_scale, lambda_data=lambda_data,
                                       generator=g_inner, return_mean=take_mean,
                                       frame_chunk=exact_frame_chunk)
@@ -709,28 +782,30 @@ def sample_daps_3d_v2(
             # PROXIMAL by default, to match the voxel arm's Newton data step.
             if tree is None:
                 raise ValueError("inner_kind='tree' needs a TreePoissonLikelihood")
-            x0_y = langevin_prox_tree(x0_hat, sigma_t, tree, lr, num_mcmc,
+            x0_y = langevin_prox_tree(x0_hat, anc, tree, lr, num_mcmc,
                                       lambda_data=lambda_data, clip_x=clip_x,
                                       generator=g_inner)
         elif inner_kind == "tree_score":
             if tree is None:
                 raise ValueError("inner_kind='tree_score' needs a TreePoissonLikelihood")
-            x0_y = langevin_tree(x0_hat, sigma_t, tree, lr, num_mcmc,
+            x0_y = langevin_tree(x0_hat, anc, tree, lr, num_mcmc,
                                  lambda_data=lambda_data, clip_x=clip_x,
                                  generator=g_inner)
         else:
             if data_score_fn is None:
                 raise ValueError("inner_kind='explicit' needs data_score_fn(x)")
-            x0_y = langevin_explicit(x0_hat, sigma_t, data_score_fn, lr, num_mcmc,
+            x0_y = langevin_explicit(x0_hat, anc, data_score_fn, lr, num_mcmc,
                                      lambda_data=lambda_data, clip_x=clip_x,
                                      generator=g_inner)
 
         if isinstance(step_log, list):
             step_log.append(dict(step=step, t=t_cur, sigma=sigma_t, lr=lr,
+                                 anchor_sd=anc,
                                  inner_kind=inner_kind, num_mcmc=int(num_mcmc),
                                  lambda_data=float(lambda_data),
-                                 readout="mean" if (take_mean and inner_kind == "exact")
-                                         else "draw"))
+                                 readout=("mode" if inner_kind == "condmap" else
+                                          "mean" if (take_mean and inner_kind == "exact")
+                                          else "draw")))
         if step < num_annealing - 1:
             x_t = x0_y + float(sigma_arr[int(t_indices[step + 1])]) * _randn_like(x0_y, g_outer)
         else:
