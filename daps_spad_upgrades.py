@@ -667,7 +667,7 @@ def sample_daps_3d_v2(
     fuse_mode="average", fuse_w=0.5, switch_sigma=0.5, temporal_first=False,
     clip_x=True, num_diffusion_steps=1000, snapshot_every=10, verbose=True,
     lr_fn=None, seed=None, exact_final_mean=True, step_log=None,
-    exact_frame_chunk=64, anchor_sd_fn=None,
+    exact_frame_chunk=64, anchor_sd_fn=None, pfode_sigma_max=None,
 ):
     """DAPS with fused priors, a sigma-scaled step size, and a choice of inner kernel.
 
@@ -710,6 +710,15 @@ def sample_daps_3d_v2(
       * ``exact_frame_chunk`` is the inner step's memory knob; it does not move
         the sampled law. Measured peak added over the inputs at 1024x256x256:
         unchunked 4.1 GiB, 256 -> 2.7, 64 -> 1.0, 16 -> 0.8.
+      * ``pfode_sigma_max``: run the ``num_inner_pfode``-step PF-ODE anchor only
+        at levels with sigma_t <= this, and the one-step Tweedie anchor above it.
+        None (default) = full depth at every level, byte-identical to before.
+        Why it is safe: above sigma ~ 1 the renoise to sigma_next adds per-voxel
+        noise as large as the whole signal range (box half-width 1), so only the
+        anchor's coarse content reaches the next level, and the one-step mean
+        already gets the coarse content right; what the ODE adds is fine detail,
+        which the renoise erases. With the 100-level linear schedule, sigma <= 1
+        leaves 25 deep levels: 500 -> 200 fused prior sweeps (17.5 h -> 7 h).
       * ``anchor_sd_fn(step, sigma_t) -> r_t`` sets the SURROGATE's standard
         deviation, N(x0_hat, r_t^2 I), for every inner kind (tether width of the
         exact draw, rho = 1/(lambda r_t^2) of condmap, anchor precision of the
@@ -729,12 +738,17 @@ def sample_daps_3d_v2(
 
         # --- inner reverse PF-ODE (EDM DDIM), fused prior at every substep ---
         x = x_t
-        if num_inner_pfode <= 1:
+        # sigma-adaptive depth: the full ODE only where its fine detail survives
+        # the next renoise (see pfode_sigma_max in the docstring).
+        depth = int(num_inner_pfode)
+        if pfode_sigma_max is not None and sigma_t > float(pfode_sigma_max):
+            depth = 1
+        if depth <= 1:
             seq = [t_cur, t_cur]
         else:
-            seq = np.unique(np.clip(np.linspace(t_cur, 0, num_inner_pfode + 1)
+            seq = np.unique(np.clip(np.linspace(t_cur, 0, depth + 1)
                                     .astype(np.int64), 0, len(sigma_arr) - 1))[::-1]
-        if num_inner_pfode <= 1:
+        if depth <= 1:
             x0_hat = tweedie_anchor(x, t_cur, sigma_arr, alphas_cumprod_t,
                                     eps_2d_fn, eps_1d_fn, fuse)
         else:
@@ -800,7 +814,7 @@ def sample_daps_3d_v2(
 
         if isinstance(step_log, list):
             step_log.append(dict(step=step, t=t_cur, sigma=sigma_t, lr=lr,
-                                 anchor_sd=anc,
+                                 anchor_sd=anc, pfode_steps=max(1, len(seq) - 1),
                                  inner_kind=inner_kind, num_mcmc=int(num_mcmc),
                                  lambda_data=float(lambda_data),
                                  readout=("mode" if inner_kind == "condmap" else
