@@ -63,7 +63,8 @@ __all__ = [
     "langevin_prox_tree",
     "binomial_loglik", "exact_inner_sample",
     "sample_daps_3d_v2", "sample_daps_v2",
-    "tweedie_anchor", "measure_anchor_mse", "anchor_sd_from_table",
+    "tweedie_anchor", "pfode_anchor", "measure_anchor_mse", "anchor_sd_from_table",
+    "probe_denoiser",
 ]
 
 
@@ -455,6 +456,99 @@ def tweedie_anchor(x_t, t_cur, sigma_arr, alphas_cumprod_t, eps_2d_fn, eps_1d_fn
 
 
 @torch.no_grad()
+def pfode_anchor(x_t, t_cur, depth, sigma_arr, alphas_cumprod_t, eps_2d_fn, eps_1d_fn, fuse):
+    """The sampler's multi-step anchor: `depth` EDM-DDIM steps from t_cur to 0 on
+    the uniform DDPM-index grid, fused prior at every substep. depth<=1 is the
+    one-step Tweedie anchor. Unclamped; callers clamp. Factored out so the
+    denoiser probe measures EXACTLY the estimator the sampler runs."""
+    depth = int(depth)
+    if depth <= 1:
+        return tweedie_anchor(x_t, t_cur, sigma_arr, alphas_cumprod_t, eps_2d_fn, eps_1d_fn, fuse)
+    seq = np.unique(np.clip(np.linspace(int(t_cur), 0, depth + 1)
+                            .astype(np.int64), 0, len(sigma_arr) - 1))[::-1]
+    x = x_t
+    for i in range(len(seq) - 1):
+        tc, tn = int(seq[i]), int(seq[i + 1])
+        sc, sn = float(sigma_arr[tc]), float(sigma_arr[tn])
+        xd = torch.sqrt(alphas_cumprod_t[tc]) * x
+        eps, _, _ = fused_eps(xd, tc, sc, eps_2d_fn, eps_1d_fn, **fuse)
+        x = x + (sn - sc) * torch.nan_to_num(eps)
+    return x
+
+
+@torch.no_grad()
+def probe_denoiser(x0_true, counts, trials, ppp_scale, t_levels, sigma_arr, alphas_cumprod_t,
+                   eps_2d_fn, eps_1d_fn, *, fuse_ws=(0.5, 1.0), cases=("inspec", "excess", "salt",
+                   "drawfed", "dc"), depth=1, seed=0, verbose=True):
+    """What does the REAL denoiser do with what the DAPS draw feeds it?
+
+    For each level sigma_t, build x_t from the clean volume five ways and run the
+    sampler's own anchor on each:
+      inspec   x0 + sigma xi                         what the denoiser was trained on
+      excess   x0 + 1.4 sigma xi                     the draw's white noise added to the renoise
+      salt     x0 + sigma xi, 1% of voxels at +1     the draw's rail mass (8-17% of hit voxels)
+      drawfed  draw(x0, sigma_prev) + sigma xi       EXACTLY what one annealing step feeds the
+                                                     next: exact per-voxel draw around the truth
+                                                     with the real counts, then renoised
+      dc       (x0 - 0.3) + sigma xi                 a level shift (the draw's box truncation
+                                                     pulls empty voxels toward the box centre)
+    and reports, per case: MSE, contrast ratio, correlation, gauge slope, gross-error
+    rate (|err| > 0.3 x = 4x in flux), rail rate, and the output's spatial-Laplacian
+    and temporal-difference energy relative to the truth's (texture invented / lost).
+    A Gaussian-prior toy with an ideal linear denoiser does NOT reproduce the real
+    draw arm's collapse (toy: corr 0.84; cluster: 0.14), so the collapse must come
+    from how these networks respond to such inputs. This measures that directly.
+    """
+    dev = x0_true.device
+    g = torch.Generator(device=dev); g.manual_seed(int(seed))
+    lap = torch.tensor([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]], device=dev).view(1, 1, 3, 3)
+    def stats(xh, x0):
+        d = xh - x0
+        xm, hm = x0.mean(), xh.mean()
+        cov = ((xh - hm) * (x0 - xm)).mean(); var = ((x0 - xm) ** 2).mean()
+        lap_r = lambda v: torch.nn.functional.conv2d(v.reshape(-1, 1, *v.shape[-2:]), lap).pow(2).mean()
+        tdiff = lambda v: (v[:, 1:] - v[:, :-1]).pow(2).mean()
+        return dict(mse=float(d.pow(2).mean()), contrast=float(xh.std() / x0.std()),
+                    corr=float(cov / (xh.std() * x0.std())), slope=float(cov / var),
+                    dc=float(hm - xm), gross=float((d.abs() > 0.3).float().mean()),
+                    rail=float((xh > 0.95).float().mean()),
+                    spatial_energy=float(lap_r(xh) / lap_r(x0)),
+                    temporal_energy=float(tdiff(xh) / tdiff(x0)))
+    rows = []
+    t_list = [int(t) for t in t_levels]
+    for k, t in enumerate(t_list):
+        sg = float(sigma_arr[t])
+        xi = torch.randn(x0_true.shape, device=dev, dtype=x0_true.dtype, generator=g)
+        inputs = {}
+        if "inspec" in cases:  inputs["inspec"] = x0_true + sg * xi
+        if "excess" in cases:  inputs["excess"] = x0_true + 1.4 * sg * xi
+        if "salt" in cases:
+            m = torch.rand(x0_true.shape, device=dev, generator=g) < 0.01
+            inputs["salt"] = torch.where(m, torch.ones_like(x0_true), x0_true) + sg * xi
+        if "drawfed" in cases:
+            # the previous level on the 100-level grid (or this one if it is the first)
+            t_prev = min(999, t + 10)
+            x0y = exact_inner_sample(x0_true, float(sigma_arr[t_prev]), counts, trials, ppp_scale,
+                                     generator=g)
+            inputs["drawfed"] = x0y + sg * xi
+        if "dc" in cases:      inputs["dc"] = (x0_true - 0.3) + sg * xi
+        for w in fuse_ws:
+            fuse = dict(mode="average", fuse_w=float(w))
+            for name, x_t in inputs.items():
+                xh = pfode_anchor(x_t, t, depth, sigma_arr, alphas_cumprod_t,
+                                  eps_2d_fn, eps_1d_fn, fuse).clamp_(-1.0, 1.0)
+                row = dict(t=t, sigma=sg, fuse_w=float(w), case=name, depth=int(depth))
+                row.update(stats(xh, x0_true)); rows.append(row)
+                if verbose:
+                    print(f"  sigma={sg:7.3f} w={w:.1f} depth={depth} {name:<8} mse={row['mse']:.4f} "
+                          f"contrast={row['contrast']:.2f} corr={row['corr']:.3f} slope={row['slope']:.2f} "
+                          f"dc={row['dc']:+.3f} gross={row['gross']:.3f} rail={row['rail']:.1e} "
+                          f"spatialE={row['spatial_energy']:.2f} temporalE={row['temporal_energy']:.2f}",
+                          flush=True)
+    return rows
+
+
+@torch.no_grad()
 def measure_anchor_mse(x0_true, t_levels, sigma_arr, alphas_cumprod_t,
                        eps_2d_fn, eps_1d_fn, fuse, *, seed=0, verbose=True):
     """Per-voxel MSE of the anchor at each noise level: the calibrated DAPS anchor
@@ -671,7 +765,19 @@ def sample_daps_3d_v2(
 ):
     """DAPS with fused priors, a sigma-scaled step size, and a choice of inner kernel.
 
-    inner_kind: "condmap" -- the conditional MAP of the SAME inner target:
+    inner_kind: "tree_condmap" -- the conditional MAP with the TREE likelihood:
+                           x0_y = tree.prox(x0_hat, rho=1/(lambda r_t^2), w(sigma_t)),
+                           deterministic, no chain, no draw. The structured data
+                           step (coupled across voxels at every scale) in the
+                           DAPS outer loop, with the mode readout that kept the
+                           per-voxel condmap clean. Motivated 2026-09-22: a deep
+                           ODE anchor preserves whatever the inner step wrote
+                           into x0_y -- per-voxel photon pushes (condmap in5:
+                           impulses 3.8e-6 -> 3.9e-3) or draw noise (exact in5:
+                           contrast 3.3x -> 4.6x) -- so it only pays off once the
+                           inner step's output is clean; the tree writes pooled
+                           evidence, not single-voxel spikes.
+                "condmap" -- the conditional MAP of the SAME inner target:
                            x0_y = prox_{lambda sigma_t^2 D}(x0_hat), deterministic,
                            no chain and no draw (needs prox_fn). The mechanism
                            control for "is it the draw or the target?": identical
@@ -748,18 +854,8 @@ def sample_daps_3d_v2(
         else:
             seq = np.unique(np.clip(np.linspace(t_cur, 0, depth + 1)
                                     .astype(np.int64), 0, len(sigma_arr) - 1))[::-1]
-        if depth <= 1:
-            x0_hat = tweedie_anchor(x, t_cur, sigma_arr, alphas_cumprod_t,
-                                    eps_2d_fn, eps_1d_fn, fuse)
-        else:
-            for i in range(len(seq) - 1):
-                tc, tn = int(seq[i]), int(seq[i + 1])
-                sc, sn = float(sigma_arr[tc]), float(sigma_arr[tn])
-                xd = torch.sqrt(alphas_cumprod_t[tc]) * x
-                eps, _, _ = fused_eps(xd, tc, sc, eps_2d_fn, eps_1d_fn, **fuse)
-                x = x + (sn - sc) * torch.nan_to_num(eps)
-            x0_hat = x
-        x0_hat = x0_hat.clamp_(-1.0, 1.0)
+        x0_hat = pfode_anchor(x, t_cur, depth, sigma_arr, alphas_cumprod_t,
+                              eps_2d_fn, eps_1d_fn, fuse).clamp_(-1.0, 1.0)
 
         # --- inner Langevin, step size from the anchor's own curvature ---
         # lr_fn wins when given: the caller's schedule must be the EXECUTED one.
@@ -792,6 +888,13 @@ def sample_daps_3d_v2(
                                       ppp_scale, lambda_data=lambda_data,
                                       generator=g_inner, return_mean=take_mean,
                                       frame_chunk=exact_frame_chunk)
+        elif inner_kind == "tree_condmap":
+            if tree is None:
+                raise ValueError("inner_kind='tree_condmap' needs a TreePoissonLikelihood")
+            rho = 1.0 / max(float(lambda_data) * anc ** 2, 1e-30)
+            x0_y = tree.prox(x0_hat, rho, w=tree.weights(float(sigma_t)))
+            if clip_x:
+                x0_y = x0_y.clamp(-1.0, 1.0)
         elif inner_kind == "tree":
             # PROXIMAL by default, to match the voxel arm's Newton data step.
             if tree is None:
@@ -817,7 +920,7 @@ def sample_daps_3d_v2(
                                  anchor_sd=anc, pfode_steps=max(1, len(seq) - 1),
                                  inner_kind=inner_kind, num_mcmc=int(num_mcmc),
                                  lambda_data=float(lambda_data),
-                                 readout=("mode" if inner_kind == "condmap" else
+                                 readout=("mode" if inner_kind in ("condmap", "tree_condmap") else
                                           "mean" if (take_mean and inner_kind == "exact")
                                           else "draw")))
         if step < num_annealing - 1:
