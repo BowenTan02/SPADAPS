@@ -65,6 +65,7 @@ __all__ = [
     "sample_daps_3d_v2", "sample_daps_v2",
     "tweedie_anchor", "pfode_anchor", "measure_anchor_mse", "anchor_sd_from_table",
     "probe_denoiser",
+    "binomial_score", "photon_dc_init", "pnp_ly_max", "pnp_calls_per_level", "pnp_ula_inner",
 ]
 
 
@@ -762,10 +763,20 @@ def sample_daps_3d_v2(
     clip_x=True, num_diffusion_steps=1000, snapshot_every=10, verbose=True,
     lr_fn=None, seed=None, exact_final_mean=True, step_log=None,
     exact_frame_chunk=64, anchor_sd_fn=None, pfode_sigma_max=None,
+    start_level=0, init_value=None,
+    pnp_eps=0.1, pnp_refresh=4, pnp_handoff="denoised", pnp_safety=0.5, pnp_ly_max=None,
 ):
     """DAPS with fused priors, a sigma-scaled step size, and a choice of inner kernel.
 
-    inner_kind: "tree_condmap" -- the conditional MAP with the TREE likelihood:
+    inner_kind: "pnp_ula" -- the network INSIDE the inner step (the paper's Eq. 6):
+                           Langevin on lambda log p(y|x) + log N(x_t; x, sigma_t^2)
+                           + log p_eps(x), prior score from the fused denoiser at
+                           eps_t = min(pnp_eps, sigma_t), refreshed every
+                           ``pnp_refresh``-th of ``num_mcmc`` steps; the next level
+                           gets the denoised final state (``pnp_handoff``), the last
+                           level the mean of the refreshes. See pnp_ula_inner.
+                           Needs obs_counts/obs_sizes/ppp_scale. 2026-09-22.
+                "tree_condmap" -- the conditional MAP with the TREE likelihood:
                            x0_y = tree.prox(x0_hat, rho=1/(lambda r_t^2), w(sigma_t)),
                            deterministic, no chain, no draw. The structured data
                            step (coupled across voxels at every scale) in the
@@ -831,15 +842,32 @@ def sample_daps_3d_v2(
         chains). None keeps DAPS's r_t = sigma_t. See measure_anchor_mse /
         anchor_sd_from_table for the Tweedie-calibrated choice. The step-size
         schedule of the chain kernels stays on sigma_t.
+      * ``start_level``: skip the first N levels of the ``num_annealing`` grid and
+        start at level N from x_t = init_value + sigma_N * noise (init_value None
+        -> 0). The start of a coarse-to-fine sampler from a forward-noised initial
+        estimate (CCDF, Chung et al. 2022). On the 100-level grid the first 61
+        levels all have sigma > 2, where the renoise buries the image; on the toy,
+        starting at level 61 from the photon-count brightness (photon_dc_init)
+        matched the full 100 levels. 0 (default) = byte-identical to before.
     """
     g_init, g_outer, g_inner = make_rng_streams(seed, device)
     t_indices = np.linspace(num_diffusion_steps - 1, 0, num_annealing + 1).astype(np.int64)
-    x_t = torch.randn(vol_shape, device=device, generator=g_init) * float(sigma_arr[-1])
+    start_level = int(start_level)
+    if not 0 <= start_level < int(num_annealing):
+        raise ValueError(f"start_level must be in [0, {num_annealing}), got {start_level}")
+    sigma_start = (float(sigma_arr[-1]) if start_level == 0
+                   else float(sigma_arr[int(t_indices[start_level])]))
+    x_t = torch.randn(vol_shape, device=device, generator=g_init) * sigma_start
+    if init_value is not None:
+        x_t = x_t + float(init_value)
+    if inner_kind == "pnp_ula" and anchor_sd_fn is not None:
+        raise ValueError("inner_kind='pnp_ula' tethers to x_t with the exact width sigma_t; "
+                         "a surrogate width (anchor_sd_fn) does not apply to it")
     fuse = dict(mode=fuse_mode, fuse_w=fuse_w, switch_sigma=switch_sigma,
                 temporal_first=temporal_first)
     traj, x0_y = [], None
 
-    for step in range(num_annealing):
+    for step in range(start_level, num_annealing):
         t_cur = int(t_indices[step]); sigma_t = float(sigma_arr[t_cur])
 
         # --- inner reverse PF-ODE (EDM DDIM), fused prior at every substep ---
@@ -864,7 +892,30 @@ def sample_daps_3d_v2(
         take_mean = bool(exact_final_mean) and step == num_annealing - 1
         # Surrogate width r_t: DAPS's sigma_t unless a calibration is supplied.
         anc = float(anchor_sd_fn(step, sigma_t)) if anchor_sd_fn is not None else sigma_t
-        if inner_kind == "condmap":
+        extra, readout = {}, None
+        if inner_kind == "pnp_ula":
+            if obs_counts is None or obs_sizes is None or ppp_scale is None:
+                raise ValueError("inner_kind='pnp_ula' needs obs_counts, obs_sizes "
+                                 "and ppp_scale")
+            # The denoiser at level eps_t, snapped to the DDPM grid; the snapped
+            # sigma is the eps of the Tweedie score, so the identity is exact.
+            sig_np = (sigma_arr.detach().cpu().numpy() if torch.is_tensor(sigma_arr)
+                      else np.asarray(sigma_arr))
+            t_eps = int(np.argmin(np.abs(sig_np - min(float(pnp_eps), sigma_t))))
+            eps_eff = float(sig_np[t_eps])
+            den = (lambda z, _t=t_eps: tweedie_anchor(z, _t, sigma_arr, alphas_cumprod_t,
+                                                      eps_2d_fn, eps_1d_fn, fuse))
+            x0_y, info = pnp_ula_inner(x0_hat, x_t, sigma_t, eps_eff, den, obs_counts,
+                                       obs_sizes, ppp_scale, num_steps=num_mcmc,
+                                       refresh=pnp_refresh, lambda_data=lambda_data,
+                                       safety=pnp_safety, ly_max=pnp_ly_max,
+                                       handoff=pnp_handoff, final_mean=take_mean,
+                                       generator=g_inner)
+            lr, readout = info["delta"], info["readout"]
+            extra = dict(pnp_calls=int(info["calls"]), pnp_delta=float(info["delta"]),
+                         pnp_eps=eps_eff, pnp_t_eps=t_eps, pnp_refresh=int(pnp_refresh),
+                         pnp_handoff=str(pnp_handoff))
+        elif inner_kind == "condmap":
             # Conditional MAP of the inner target: no Brownian term, no chain.
             # A prox arm with num_mcmc=1 is NOT this -- its first half-step kicks
             # the iterate by sqrt(2 lr) ~ sqrt(2) sigma_t before the solve.
@@ -916,21 +967,25 @@ def sample_daps_3d_v2(
                                      generator=g_inner)
 
         if isinstance(step_log, list):
+            if readout is None:
+                readout = ("mode" if inner_kind in ("condmap", "tree_condmap") else
+                           "mean" if (take_mean and inner_kind == "exact") else "draw")
             step_log.append(dict(step=step, t=t_cur, sigma=sigma_t, lr=lr,
                                  anchor_sd=anc, pfode_steps=max(1, len(seq) - 1),
                                  inner_kind=inner_kind, num_mcmc=int(num_mcmc),
                                  lambda_data=float(lambda_data),
-                                 readout=("mode" if inner_kind in ("condmap", "tree_condmap") else
-                                          "mean" if (take_mean and inner_kind == "exact")
-                                          else "draw")))
+                                 readout=readout, **extra))
         if step < num_annealing - 1:
             x_t = x0_y + float(sigma_arr[int(t_indices[step + 1])]) * _randn_like(x0_y, g_outer)
         else:
             x_t = x0_y
         if (step % snapshot_every == 0) or (step == num_annealing - 1):
             traj.append((step, t_cur, sigma_t, x0_y.detach().cpu().clone()))
-        if verbose and (step % max(1, num_annealing // 10) == 0):
+        if verbose and (step % max(1, num_annealing // 10) == 0 or step == start_level):
             chain = ("inner=exact (no chain)" if inner_kind == "exact" else
+                     f"pnp eps={extra['pnp_eps']:.3f} delta={lr:.2e} "
+                     f"tether e-folds={num_mcmc*lr/sigma_t**2:.2f} net calls={extra['pnp_calls']}"
+                     if inner_kind == "pnp_ula" else
                      f"lr={lr:.2e} tau/s^2={num_mcmc*lr/sigma_t**2:.2e}")
             print(f"  step {step:3d} t={t_cur:4d} sigma={sigma_t:8.3f} {chain} "
                   f"x0_y=[{x0_y.min():+.3f},{x0_y.max():+.3f}]", flush=True)
@@ -1077,3 +1132,161 @@ def exact_inner_sample(x0_hat, sigma_t, counts, trials, ppp_scale, *, lambda_dat
             buf[sel] = val.to(buf.dtype)
         out[sl] = buf
     return out
+
+
+# ---------------------------------------------------------------------------
+# 8. Network-in-the-loop inner step (DAPS paper Eq. 6 / PnP-ULA), 2026-09-22
+# ---------------------------------------------------------------------------
+# Why. The 2026-09-23 denoiser probe measured the isotropic surrogate
+# N(x0_hat, sigma_t^2 I) as 5-10x too wide per voxel on the real priors, and the
+# draw it produces as poison for them (1.4x noise -> invented texture, truncation
+# -> darkening). The paper's own alternative (its Eq. 6) replaces the surrogate by
+# the exact tether and a prior score at a small noise level:
+#     grad log p(x0 | x_t) ~= (x_t - x0) / sigma_t^2 + s(x0, eps),
+#     s(x, eps) = (D_eps(x) - x) / eps^2          (Tweedie; D_eps = the denoiser)
+# so the draw's spread is shaped by the network instead of being white.
+# Cost: one fused prior sweep per network call. Two savings, both measured on the
+# Gaussian-ring toy (toy_eq6*.py, 2026-09-22) at 39 levels from sigma = 2:
+#   * refresh the network every r-th step and reuse its output in between (MYULA
+#     style: (D_bar - x)/eps^2 with D_bar frozen). r = 4 vs every step: brightness
+#     error 0.00 vs -0.01, voxels off >4x 0.3% vs 0.6%, corr 0.83 vs 0.83, at 545
+#     vs 1,989 network calls. The price is a NARROWER draw: between refreshes the
+#     frozen output pulls with stiffness 1/eps^2 instead of the prior's own
+#     curvature. In a per-voxel Gaussian test (prior variance 4 eps^2) the sd is
+#     0.93x / 0.92x / 0.87x the target's at r = 2 / 3 / 4, the mean exact
+#     (tests/test_daps_pnp_ula.py). Toward the mean, i.e. the safe side for the
+#     next denoiser; r = 1 removes it;
+#   * score at eps_t = min(eps, sigma_t) with eps = 0.1 rather than 0.05: 0.05
+#     forces 4x smaller steps and left 4.7% of voxels off >4x (0.6% at 0.1).
+# The chain's own state carries eps-level noise; handing it raw to the next level
+# would feed the next denoiser extra noise (the probe's failure), so the default
+# hand-off denoises it once more ("denoised"). "raw" is kept as an ablation.
+def binomial_score(x, counts, trials, ppp_scale, log_flux_max=math.log(1e4)):
+    """d/dx of ``binomial_loglik``: kappa n (y / expm1(n) - (M - y)), n = ppp e^{kappa(x+1)}.
+
+    Analytic and expm1-stable (no 0/0 at n -> 0); broadcasts like binomial_loglik.
+    Same likelihood contract as the exact sampler and the certified prox: dark 0,
+    b_offset 0."""
+    kappa = log_flux_max / 2.0
+    n = ppp_scale * torch.exp(kappa * (x + 1.0))
+    em = torch.expm1(n).clamp_min(torch.finfo(n.dtype).tiny)
+    return kappa * n * (counts / em - (trials - counts))
+
+
+def photon_dc_init(counts, trials, ppp_scale, log_flux_max=math.log(1e4)):
+    """The maximum-likelihood CONSTANT image, in normalised log-flux: the one number x
+    whose expected photon total equals the observed total (binomial with a common
+    per-frame detection probability p: p_hat = sum(y) / sum(M)). Used to start the
+    annealing part-way down (``start_level``) at the right overall brightness. It
+    uses the total count only -- no per-pixel pooling. Clamped to [-1, 1]."""
+    kappa = log_flux_max / 2.0
+    c = torch.as_tensor(counts, dtype=torch.float64)
+    tr = torch.as_tensor(trials, dtype=torch.float64, device=c.device)
+    if tr.ndim == 1:
+        tr = tr.view(*([1] * (c.ndim - 3)), -1, 1, 1)
+    total_trials = float(torch.broadcast_to(tr, c.shape).sum())
+    p = min(max(float(c.sum()) / total_trials, 1e-300), 1.0 - 1e-12)
+    x = math.log(-math.log1p(-p) / float(ppp_scale)) / kappa - 1.0
+    return float(min(max(x, -1.0), 1.0))
+
+
+def pnp_ly_max(trials, ppp_scale, lambda_data=1.0, log_flux_max=math.log(1e4)):
+    """Largest curvature of lambda * log p(y|x) over the box: kappa^2 * M_max * n(x=1)
+    (the empty-voxel term dominates; hit voxels are smaller). 8.3 at ppp 0.001."""
+    kappa = log_flux_max / 2.0
+    m_max = float(torch.as_tensor(trials).max())
+    return float(lambda_data) * kappa ** 2 * m_max * float(ppp_scale) * math.exp(2.0 * kappa)
+
+
+def pnp_calls_per_level(num_steps, refresh, handoff="denoised", last=False, final_mean=True):
+    """Network (fused prior sweep) calls of ONE pnp_ula inner step, the anchor excluded.
+    The single source of the count, used by the sampler's log and the runner's cost
+    model. Refreshes happen at steps r, 2r, ... < K (step 0 reuses the anchor, which
+    is already a denoiser output); the hand-off costs one more call unless the level
+    reads out the mean of the refreshes (the last level, when it has any)."""
+    K, r = int(num_steps), max(1, int(refresh))
+    ks = [k for k in range(1, K) if k % r == 0]
+    if last and final_mean and any(k >= K // 2 for k in ks):
+        return len(ks)
+    return len(ks) + (1 if handoff == "denoised" else 0)
+
+
+@torch.no_grad()
+def pnp_ula_inner(x0_hat, x_t, sigma_t, eps_t, denoise_fn, counts, trials, ppp_scale, *,
+                  num_steps=50, refresh=4, lambda_data=1.0, safety=0.5, ly_max=None,
+                  handoff="denoised", final_mean=False, generator=None,
+                  log_flux_max=math.log(1e4), frame_chunk=128):
+    """One DAPS inner step with the network inside: unadjusted Langevin on
+        lambda log p(y|x) + log N(x_t; x, sigma_t^2) + log p_eps(x),
+    started at the anchor, prior score (D_bar - x)/eps_t^2 with D_bar = denoise_fn(x)
+    refreshed every ``refresh``-th step (D_bar = x0_hat until the first refresh).
+
+    denoise_fn(x) must be the fused denoiser AT LEVEL eps_t (tweedie_anchor at the
+    matching DDPM index), so (D - x)/eps_t^2 is the Tweedie score of p_eps.
+    Step: delta = safety / L_pi, L_pi = 1/sigma_t^2 + 1/eps_t^2 + ly_max -- the sum of
+    the three curvature bounds, so the explicit step is stable for every term. The
+    likelihood is evaluated at clamp(x, -1, 1) (its curvature bound holds on the box);
+    the chain itself is not clamped (projected ULA inflates the rail mass).
+
+    Returns (x0_y, info). x0_y, clamped to [-1, 1], is
+      * the mean of the refreshed D_bar over the second half of the chain if
+        ``final_mean`` (use on the last annealing level: no renoise follows);
+      * otherwise denoise_fn(final state) if handoff == "denoised" (default), or the
+        raw final state if "raw" (carries eps-level noise into the next level).
+    info = dict(calls, delta, eps, readout, n_mean); calls == pnp_calls_per_level(...).
+    """
+    K, r = int(num_steps), max(1, int(refresh))
+    if handoff not in ("denoised", "raw"):
+        raise ValueError(f"handoff must be 'denoised' or 'raw', got {handoff!r}")
+    kappa = log_flux_max / 2.0
+    trials = torch.as_tensor(trials, device=x0_hat.device, dtype=x0_hat.dtype)
+    if trials.ndim == 1:
+        trials = trials.view(1, -1, *([1] * (x0_hat.ndim - 2)))
+    counts = torch.as_tensor(counts, device=x0_hat.device, dtype=x0_hat.dtype)
+    if counts.ndim == x0_hat.ndim - 1:
+        counts = counts.unsqueeze(0)
+    if ly_max is None:
+        ly_max = pnp_ly_max(trials, ppp_scale, lambda_data, log_flux_max)
+    lam = float(lambda_data)
+    s2, e2 = float(sigma_t) ** 2, float(eps_t) ** 2
+    delta = float(safety) / (1.0 / s2 + 1.0 / e2 + float(ly_max))
+    noise_sd = math.sqrt(2.0 * delta)
+
+    x = x0_hat.clone()
+    d_bar = x0_hat
+    drift = torch.empty_like(x)
+    noise = torch.empty_like(x)
+    T = x.shape[1]
+    step_t = max(1, int(frame_chunk))
+    acc, n_acc, calls = None, 0, 0
+    for k in range(K):
+        if k > 0 and k % r == 0:
+            d_bar = denoise_fn(x)
+            calls += 1
+            if final_mean and k >= K // 2:
+                acc = d_bar.clone() if acc is None else acc.add_(d_bar)
+                n_acc += 1
+        for t0 in range(0, T, step_t):
+            sl = (slice(None), slice(t0, min(t0 + step_t, T)))
+            xs = x[sl]
+            tr = trials[sl] if trials.shape[1] == T else trials
+            g = lam * binomial_score(xs.clamp(-1.0, 1.0), counts[sl], tr, ppp_scale,
+                                     log_flux_max)
+            g += (x_t[sl] - xs) / s2
+            g += (d_bar[sl] - xs) / e2
+            drift[sl] = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+        if generator is None:
+            noise.normal_()
+        else:
+            noise.normal_(generator=generator)
+        x.add_(drift, alpha=delta).add_(noise, alpha=noise_sd)
+
+    if final_mean and n_acc > 0:
+        out, readout = acc / n_acc, "mean"
+    elif handoff == "denoised":
+        out, readout = denoise_fn(x), "draw"
+        calls += 1
+    else:
+        out, readout = x, "draw"
+    return out.clamp(-1.0, 1.0), dict(calls=calls, delta=delta, eps=float(eps_t),
+                                      readout=readout, n_mean=n_acc)
